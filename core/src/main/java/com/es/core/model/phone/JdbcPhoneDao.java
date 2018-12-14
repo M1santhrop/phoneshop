@@ -1,6 +1,5 @@
 package com.es.core.model.phone;
 
-import org.omg.CORBA.ObjectHelper;
 import org.springframework.jdbc.core.BeanPropertyRowMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -9,46 +8,66 @@ import org.springframework.jdbc.core.namedparam.SqlParameterSource;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
-import java.lang.reflect.Field;
-import java.util.*;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Component
 public class JdbcPhoneDao implements PhoneDao {
-    private final String SQL_SQLECT_ALL_PHONES_BY_ID = "select * from phones where id = ?";
+    private static final String SQL_SELECT_ALL_PHONES = "select * from phones ";
+    private final String SQL_SELECT_PHONE_BY_ID = SQL_SELECT_ALL_PHONES + "where id = :id";
     private final String SQL_INSERT_INTO_PHONES = "insert into phones values (" +
             ":id, :brand, :model, :price, :displaySizeInches, :weightGr, :lengthMm, :widthMm, :heightMm, :announced," +
             " :deviceType, :os, :displayResolution, :pixelDensity, :displayTechnology, :backCameraMegapixels, :frontCameraMegapixels," +
             " :ramGb, :internalStorageGb, :batteryCapacityMah, :talkTimeHours, :standByTimeHours, :bluetooth, :positioning, :imageUrl, :description)";
-    private final String SQL_INSERT_INTO_PHONE2COLOR = "insert into phone2color values (?, ?)";
+    private final String SQL_INSERT_INTO_PHONE2COLOR = "insert into phone2color values (:phoneId, :colorId)";
     private final String SQL_SELECT_MAX_ID_FROM_PHONES = "select max(id) from phones";
-    private final String SQL_SELECT_ALL_FROM_PHONES_OFFSET_LIMIT = "select * from phones limit ? offset ?";
-    private final String SQL_SELECT_ALL_FROM_COLORS = "select * from colors";
-    private final String SQL_SELECT_COLORID_FROME_PHONE2COLOR_BY_PHONEID = "select colorId from phone2color where phoneId = ?";
-    private final String SQL_DELETE_FROM_PHONES_BY_ID = "delete from phones where id = ?";
+    private final String SQL_LIMIT_OFFSET = " limit ? offset ?";
+    private final String SQL_SEARCH = "and lower(brand) like ? ";
+    private final String SQL_AVAILABLE_PHONES = "inner join stocks on phones.id = stocks.phoneId where stocks.stock > 0 and phones.price is not null ";
+    private final String SQL_SELECT_ALL_FROM_PHONES_OFFSET_LIMIT = (SQL_SELECT_ALL_PHONES + SQL_AVAILABLE_PHONES + SQL_SEARCH + SQL_LIMIT_OFFSET);
+    private final String SQL_SELECT_ALL_COLORS = "select * from colors";
+    private final String SQL_DELETE_FROM_PHONES_BY_ID = "delete from phones where id = :id";
+    private final String SQL_COUNT_PHONES = "select count(*) from phones ";
+    private final String SQL_SEARCH_AND_SORT = SQL_SEARCH + "order by phones.";
+    private final String SELECT_COLORS_BELONGS_TO_PHONE_ID = SQL_SELECT_ALL_COLORS + " inner join phone2color " +
+            "on colors.id = phone2color.colorId where phone2color.phoneId = ";
+    private final String SQL_NUMBER_AVAILABLE_PHONES = SQL_COUNT_PHONES + SQL_AVAILABLE_PHONES + SQL_SEARCH;
 
     @Resource
     private JdbcTemplate jdbcTemplate;
+
+    private NamedParameterJdbcTemplate namedParameterJdbcTemplate;
+    private SqlParameterSource sqlParameterSource;
     private BeanPropertyRowMapper<Phone> phoneBeanPropertyRowMapper = new BeanPropertyRowMapper<>(Phone.class);
     private BeanPropertyRowMapper<Color> colorBeanPropertyRowMapper = new BeanPropertyRowMapper<>(Color.class);
 
+    @Override
     public Optional<Phone> get(Long key) {
-        Phone phone = this.jdbcTemplate.queryForObject(SQL_SQLECT_ALL_PHONES_BY_ID, new Object[]{key}, phoneBeanPropertyRowMapper);
+        this.sqlParameterSource = new MapSqlParameterSource("id", key);
+        this.namedParameterJdbcTemplate = new NamedParameterJdbcTemplate(jdbcTemplate);
+        Phone phone = this.namedParameterJdbcTemplate.queryForObject(SQL_SELECT_PHONE_BY_ID, sqlParameterSource, phoneBeanPropertyRowMapper);
         return Optional.ofNullable(phone);
     }
 
+    @Override
     public void save(Phone phone) {
-        if (phone == null || get(phone.getId()).isPresent()){
+        if (phone == null) {
             throw new IllegalArgumentException();
         }
         if (phone.getId() == null) {
-            phone.setId(maxPhoneId());
+            phone.setId(maxPhoneId() + 1);
         }
-        NamedParameterJdbcTemplate namedParameterJdbcTemplate = new NamedParameterJdbcTemplate(jdbcTemplate);
-        namedParameterJdbcTemplate.update(SQL_INSERT_INTO_PHONES, getAllValuesPhone(phone));
+
+        this.namedParameterJdbcTemplate = new NamedParameterJdbcTemplate(jdbcTemplate);
+        this.namedParameterJdbcTemplate.update(SQL_INSERT_INTO_PHONES, getAllValuesPhone(phone));
 
         for (Color color : phone.getColors()) {
-            this.jdbcTemplate.update(SQL_INSERT_INTO_PHONE2COLOR, phone.getId(), color.getId());
+            this.namedParameterJdbcTemplate.update(SQL_INSERT_INTO_PHONE2COLOR, getAllValuesPhone2Color(phone.getId(), color.getId()));
         }
     }
 
@@ -56,27 +75,49 @@ public class JdbcPhoneDao implements PhoneDao {
         return this.jdbcTemplate.queryForObject(SQL_SELECT_MAX_ID_FROM_PHONES, long.class);
     }
 
-    public List<Phone> findAll(int offset, int limit) {
-        List<Phone> phones = this.jdbcTemplate.query(SQL_SELECT_ALL_FROM_PHONES_OFFSET_LIMIT, new Object[]{limit, offset}, phoneBeanPropertyRowMapper);
-        List<Color> colors = this.jdbcTemplate.query(SQL_SELECT_ALL_FROM_COLORS, colorBeanPropertyRowMapper);
-        putColorsInPhones(phones, colors);
+    @Override
+    public List<Phone> findAll(int offset, int limit, String search) {
+        List<Phone> phones = this.jdbcTemplate.query(SQL_SELECT_ALL_FROM_PHONES_OFFSET_LIMIT, new Object[]{search, limit, offset}, phoneBeanPropertyRowMapper);
+        for (Phone phone : phones) {
+            setColor(phone);
+        }
         return phones;
     }
 
-    private void putColorsInPhones(List<Phone> phones, List<Color> colors) {
-        Map<Long, String> colorsMap = colors.stream().collect(Collectors.toMap(Color::getId, Color::getCode));
-        for (Phone phone : phones) {
-            List<Long> colorId = this.jdbcTemplate.queryForList(SQL_SELECT_COLORID_FROME_PHONE2COLOR_BY_PHONEID, new Object[]{phone.getId()}, long.class);
-            Set<Color> colorsForPhone = new HashSet();
-            for (Long id : colorId) {
-                colorsForPhone.add(new Color(id, colorsMap.get(id)));
-            }
-            phone.setColors(colorsForPhone);
-        }
+    private void setColor(Phone phone) {
+        Long phoneId = phone.getId();
+        List<Color> colors = jdbcTemplate.query(SELECT_COLORS_BELONGS_TO_PHONE_ID + phoneId, colorBeanPropertyRowMapper);
+        phone.setColors(new HashSet<>(colors));
     }
 
+    @Override
     public void delete(Phone phone) {
-        this.jdbcTemplate.update(SQL_DELETE_FROM_PHONES_BY_ID, phone.getId());
+        this.sqlParameterSource = new MapSqlParameterSource("id", phone.getId());
+        this.namedParameterJdbcTemplate = new NamedParameterJdbcTemplate(jdbcTemplate);
+        this.namedParameterJdbcTemplate.update(SQL_DELETE_FROM_PHONES_BY_ID, sqlParameterSource);
+    }
+
+    @Override
+    public int getNumberAvailablePhones(String search) {
+        search = search.trim().toLowerCase();
+        return this.jdbcTemplate.queryForObject(SQL_NUMBER_AVAILABLE_PHONES, Integer.class, search);
+    }
+
+    @Override
+    public List<Phone> findAllSorted(int offset, int limit, String search, String sort, String direction) {
+        List<Phone> phones = this.jdbcTemplate.query(SQL_SELECT_ALL_PHONES + SQL_AVAILABLE_PHONES + SQL_SEARCH_AND_SORT +
+                sort  + " " + direction.toUpperCase() + SQL_LIMIT_OFFSET, phoneBeanPropertyRowMapper, search, limit, offset);
+        for (Phone phone : phones) {
+            setColor(phone);
+        }
+        return phones;
+    }
+
+    private Map<String, Object> getAllValuesPhone2Color(long phoneId, long colorId) {
+        Map<String, Object> allValuesPhone2Color = new HashMap<>();
+        allValuesPhone2Color.put("phoneId", phoneId);
+        allValuesPhone2Color.put("colorId", colorId);
+        return allValuesPhone2Color;
     }
 
     private Map<String, Object> getAllValuesPhone(Phone phone) {
